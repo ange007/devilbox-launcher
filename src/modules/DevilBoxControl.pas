@@ -57,12 +57,18 @@ type
   public
     {Options}
     function ReadOptions: Boolean;
+    function SetOption(const name, value: string): Boolean;
+    function GetOption(const name: string): string;
 
     {Domains}
     function ReadDomains: Boolean;
     function AddDomain(const name: string): string;
     function RemoveDomain(const name: string): Boolean;
     function OpenDomainDir(const name: string): string;
+
+    {}
+    function GetHostsFileName: string;
+    function SaveHosts: Boolean;
 
     {Modules}
     function SetModuleState(const module: string; const active: Boolean): Boolean;
@@ -78,7 +84,7 @@ type
 
     {}
     function RebuildENV: Boolean;
-    function Build: Boolean;
+    function Build(const writeHosts: Boolean = True): Boolean;
     procedure Run(const needRemove: Boolean = True);
     procedure Stop;
     procedure CheckRunState;
@@ -159,11 +165,11 @@ end;
 
 destructor TDevilBoxControl.Destroy;
 begin
-  FreeAndNil(FHTTPClient);
-  FreeAndNil(FModules);
-  FreeAndNil(FOptions);
-  FreeAndNil(FDomains);
-  FreeAndNil(FStartedModules);
+  try FreeAndNil(FHTTPClient); except end;
+  try FreeAndNil(FModules); except end;
+  try FreeAndNil(FOptions); except end;
+  try FreeAndNil(FDomains); except end;
+  try FreeAndNil(FStartedModules); except end;
 end;
 
 {
@@ -177,6 +183,8 @@ var
   moduleList: TArray<string>;
   envLine, envOptionName, envOptionValue, moduleName, moduleServer: string;
 begin
+  Result := False;
+
   {Check ENV file}
   if not (FileExists(FWorkPath + '.env')) then
   begin
@@ -194,7 +202,7 @@ begin
   begin
     envOptionName := envList.Names[i].Trim;
     envOptionValue := envList.ValueFromIndex[i].Trim;  
-    if (Pos('#', envOptionName) = 1) or (envOptionValue.IsEmpty) then Continue;
+    if (Pos('#', envOptionName) = 1) or (envOptionName.IsEmpty) then Continue;
 
     FOptions.AddOrSetValue(envOptionName, envOptionValue);
   end;
@@ -221,6 +229,20 @@ begin
   Result := True;
 end;
 
+function TDevilBoxControl.SetOption(const name, value: string): Boolean;
+begin
+  FOptions.AddOrSetValue(UpperCase(name), value);
+
+  Result := True;
+end;
+
+function TDevilBoxControl.GetOption(const name: string): string;
+var
+  value: Variant;
+begin
+  if FOptions.TryGetValue(name, value) then Result := value;
+end;
+
 function TDevilBoxControl.RebuildENV: Boolean;
 var
   i: Integer;
@@ -239,7 +261,7 @@ begin
   {Read file}
   envList := TStringList.Create;
   envList.StrictDelimiter := True;
-  envList.LoadFromFile(FWorkPath + '.env', TEncoding.UTF8);
+  envList.LoadFromFile(FWorkPath + '.env');
 
   {}
   serverList := [];
@@ -262,7 +284,9 @@ begin
       
     for optionName in FOptions.Keys do
     begin
-      if envOptionName <> optionName then Continue;
+      if (envOptionName <> optionName)
+        or (Pos('###', envList.Names[i]) = 1) then Continue;
+
       optionValue := FOptions.Items[optionName];
 
       if MatchStr(envOptionName, serverList) then
@@ -274,13 +298,13 @@ begin
       end
       else
       begin
-        envList.ValueFromIndex[i] := optionValue;
+        envList.ValueFromIndex[i] := IfThen(optionValue.IsEmpty, ' ', optionValue);
       end;
     end;
   end;
 
   {Save ENV file}
-  envList.SaveToFile(FWorkPath + '.env', TEncoding.UTF8);
+  envList.SaveToFile(FWorkPath + '.env');
 end;
 
 {
@@ -290,14 +314,17 @@ end;
 function TDevilBoxControl.ReadDomains: Boolean;
 var
   DList, FList: TStringDynArray;
-  directory, fileName: string;
+  domainDirectory, directory, fileName: string;
   LSearchOption: TSearchOption;
 begin
   Result := False;
+  domainDirectory := FWorkPath + 'data' + PathDelim + 'www';
   LSearchOption := TSearchOption.soTopDirectoryOnly;
 
+  if not (DirectoryExists(domainDirectory)) then Exit;
+
   try
-    DList := TDirectory.GetDirectories(FWorkPath + 'data' + PathDelim + 'www', '*', LSearchOption);
+    DList := TDirectory.GetDirectories(domainDirectory, '*', LSearchOption);
     for directory in DList do FDomains.Add(ExtractFileName(directory));
 
     Result := True; 
@@ -344,6 +371,87 @@ begin
 
   path := FWorkPath + 'data' + PathDelim + 'www' + PathDelim + name;
   RunCommand('open', path, '');
+end;
+
+{}
+
+function TDevilBoxControl.GetHostsFileName: string;
+
+  {$IFDEF MSWINDOWS}
+  function getSysDir: string;
+  var
+    Buffer: array[0..MAX_PATH] of Char;
+  begin
+     GetSystemDirectory(Buffer, MAX_PATH - 1);
+     SetLength(Result, StrLen(Buffer));
+     Result := Buffer;
+  end;
+  {$ENDIF}
+
+begin
+  {$IFDEF MSWINDOWS}
+    Result := IncludeTrailingPathDelimiter(getSysDir) + 'drivers\etc\hosts';
+  {$ELSEIF LINUX}
+    Result := '\etc\hosts';
+  {$ENDIF}
+end;
+
+function TDevilBoxControl.SaveHosts: Boolean;
+var
+  fileAttributes: TFileAttributes;
+  hostsList: TStringList;
+  i, j: Integer;
+  hostsFileName, startLine, endLine, hostLine: string;
+  startLineIndex, endLineIndex: Integer;
+begin
+  hostsFileName := GetHostsFileName;
+  startLine := '# Start - DevilBox';
+  endLine := '## End - DevilBox';
+
+  fileAttributes := [];
+  TFile.SetAttributes(hostsFileName, fileAttributes);
+
+  {Write to file}
+  hostsList := TStringList.Create;
+  try
+    hostsList.LoadFromFile(hostsFileName);
+
+    startLineIndex := hostsList.IndexOf(startLine);
+    endLineIndex := hostsList.IndexOf(endLine);
+
+    {Remove section}
+    if (startLineIndex >= 0) and (endLineIndex >= 0) then
+    begin
+      for i := endLineIndex downto startLineIndex do hostsList.Delete(i);
+    end;
+
+    {Add start line}
+    hostsList.Add(startLine);
+
+    {}
+    for i := 0 to FDomains.Count - 1 do
+    begin
+      hostLine := '127.0.0.1 ' + FDomains[i] + '.' + GetOption('TLD_SUFFIX');
+      if hostsList.IndexOf(hostLine) = -1 then hostsList.Add(hostLine);
+    end;
+
+    {Add end line}
+    hostsList.Add(endLine);
+
+    {Save list}
+    try
+      hostsList.SaveToFile(hostsFileName);
+    except
+      on e: Exception do ShowMessage('Error writing "host" file:' + #13#10 + e.Message);
+    end;
+  finally
+    FreeAndNil(hostsList);
+  end;
+
+  {}
+  Include(fileAttributes, TFileAttribute.faSystem);
+  Include(fileAttributes, TFileAttribute.faReadOnly);
+  TFile.SetAttributes(hostsFileName, fileAttributes);
 end;
 
 {
@@ -574,10 +682,13 @@ end;
 
 }
 
-function TDevilBoxControl.Build: Boolean;
+function TDevilBoxControl.Build(const writeHosts: Boolean): Boolean;
 begin
   {Build options}
   RebuildENV;
+
+  {Save hosts}
+  if writeHosts then SaveHosts;
 end;
 
 procedure TDevilBoxControl.Run(const needRemove: Boolean);
